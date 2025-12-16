@@ -3,6 +3,7 @@ GloveAndHisBoy Discord Bot - Random Number Generator with Verification
 Main bot file
 """
 
+import argparse
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -67,6 +68,24 @@ command_queue = CommandQueue(delay_seconds=config.COMMAND_QUEUE_DELAY)
 # Initialize roll logger
 roll_logger = RollLogger()
 
+# ---- Parse CLI arguments ----
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--env",
+    choices=["pokemon", "lego"],
+    default="pokemon",
+    help="Run environment"
+)
+args = parser.parse_args()
+
+guild_id_str = os.getenv('TESTING_GUILD_ID')
+allow_id = config.ALLOWED_CHANNEL_ID
+roll_id = config.ROLL_LOG_CHANNEL_ID
+if args.env != "pokemon":
+    guild_id_str = os.getenv('LR_GUILD_ID')
+    allow_id = config.LR_ALLOWED_CHANNEL_ID
+    roll_id = config.LR_ROLL_LOG_CHANNEL_ID
+
 # Initialize Reddit manager
 try:
     reddit_manager = RedditManager(
@@ -91,39 +110,39 @@ async def on_ready():
     
     # Register persistent views for buttons
     bot.add_view(VerificationButton(verification_db))
-    
+
     # Sync commands to the guild (this clears and re-registers, preventing duplicates)
     try:
-        guild = discord.Object(id=int(os.getenv('TESTING_GUILD_ID')))
+        guild = discord.Object(id=int(guild_id_str))
         # Clear existing commands first
         bot.tree.clear_commands(guild=guild)
         # Copy commands to guild
         bot.tree.copy_global_to(guild=guild)
         # Sync to guild (updates instantly for guild-specific commands)
         synced = await bot.tree.sync(guild=guild)
-        logger.info(f"Synced {len(synced)} command(s) to guild {os.getenv('TESTING_GUILD_ID')}")
+        logger.info(f"Synced {len(synced)} command(s) to guild {guild_id_str}")
     except Exception as e:
         logger.exception(f"Error syncing commands: {e}")
     
     # Auto-cleanup user spam messages on startup
     try:
-        channel = bot.get_channel(config.ALLOWED_CHANNEL_ID)
+        channel = bot.get_channel(allow_id)
         if channel:
             logger.info("Starting startup cleanup of user messages...")
             await startup_cleanup(channel)
         else:
-            logger.warning(f"Could not find channel {config.ALLOWED_CHANNEL_ID} for startup cleanup")
+            logger.warning(f"Could not find channel {allow_id} for startup cleanup")
     except Exception as e:
         logger.exception(f"Error during startup cleanup: {e}")
     
     # Initialize roll logger from existing data
     try:
-        roll_log_channel = bot.get_channel(config.ROLL_LOG_CHANNEL_ID)
+        roll_log_channel = bot.get_channel(roll_id)
         if roll_log_channel:
             logger.info("Initializing roll logger from existing data...")
             await roll_logger.initialize_from_channel(roll_log_channel)
         else:
-            logger.warning(f"Could not find roll log channel {config.ROLL_LOG_CHANNEL_ID}")
+            logger.warning(f"Could not find roll log channel {roll_id}")
     except Exception as e:
         logger.exception(f"Error initializing roll logger: {e}")
         logger.exception(f"Error during startup cleanup: {e}")
@@ -135,9 +154,9 @@ async def on_message(message):
     # Ignore bot's own messages
     if message.author.bot:
         return
-    
+
     # Check if message is in the allowed channel
-    if message.channel.id == config.ALLOWED_CHANNEL_ID:
+    if message.channel.id == allow_id:
         logger.info(f"Message detected in monitored channel from {message.author} (ID: {message.author.id}): '{message.content[:50]}'")
         
         # Check for admin cleanup commands
@@ -285,11 +304,11 @@ async def call_command(
     winners: int = 1
 ):
     """Slash command to generate random winners"""
-    
+
     # Check if command is used in the correct channel
-    if interaction.channel_id != config.ALLOWED_CHANNEL_ID:
+    if interaction.channel_id != allow_id:
         await interaction.response.send_message(
-            f"❌ This command can only be used in <#{config.ALLOWED_CHANNEL_ID}>",
+            f"❌ This command can only be used in <#{allow_id}>",
             ephemeral=True
         )
         return
@@ -398,11 +417,11 @@ async def process_call_command(
         
         # Log numbers to roll history
         try:
-            roll_log_channel = bot.get_channel(config.ROLL_LOG_CHANNEL_ID)
+            roll_log_channel = bot.get_channel(roll_id)
             if roll_log_channel:
                 await roll_logger.log_roll(roll_log_channel, numbers)
             else:
-                logger.warning(f"Roll log channel {config.ROLL_LOG_CHANNEL_ID} not found")
+                logger.warning(f"Roll log channel {roll_id} not found")
         except Exception as e:
             logger.exception(f"Error logging roll to history: {e}")
         
