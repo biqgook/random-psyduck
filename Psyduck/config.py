@@ -3,8 +3,9 @@ Configuration settings for GloveAndHisBoy Discord Bot
 """
 
 # Discord Configuration
-ALLOWED_CHANNEL_ID = 1450311167452123207
-ROLL_LOG_CHANNEL_ID = 1450342934573617353  # Channel for daily roll history
+ALLOWED_CHANNEL_ID = 1450311167452123207 # PR botcalls
+ROLL_LOG_CHANNEL_ID = 1450342934573617353  # PR roll-log
+
 ADMIN_USER_ID = 975054002431606844  # User who can run admin commands
 
 # Random.org Configuration

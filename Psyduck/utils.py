@@ -14,7 +14,7 @@ logger = logging.getLogger('GloveAndHisBoy')
 
 def create_winner_embed(numbers: list, request_count: int, request_limit: int, 
                        reddit_info: dict = None, timestamp: str = None, total_spots: int = None, 
-                       caller_name: str = None) -> discord.Embed:
+                       caller_name: str = None, need_detailed_winners: bool = False) -> discord.Embed:
     """
     Create a Discord embed with Reddit post info and timestamp
     
@@ -30,24 +30,18 @@ def create_winner_embed(numbers: list, request_count: int, request_limit: int,
     Returns:
         Discord Embed object
     """
-    embed = discord.Embed(
-        title="🎲",
-        color=config.EMBED_COLOR
-    )
+    logger.info(f"Building embed with Reddit info - Author: {reddit_info.get('author')}, Has image: {bool(reddit_info.get('image_url'))}")
     
     # Build description with all info in vertical order
     description_lines = []
-    
-    if reddit_info:
-        logger.info(f"Building embed with Reddit info - Author: {reddit_info.get('author')}, Has image: {bool(reddit_info.get('image_url'))}")
-        # Author and Link on same line separated by |
-        description_lines.append(f"[{reddit_info['author']}]({reddit_info['author_url']}) | [Raffle Link]({reddit_info['url']})")
-    else:
-        logger.warning("No Reddit info provided to embed")
-    
+    embed = discord.Embed(
+        title=reddit_info['title'],
+        color=config.EMBED_COLOR
+    )
+
     # Spots indicator (e.g., "1-100")
     if total_spots:
-        description_lines.append(f"**Spots:** 1-{total_spots}")
+        description_lines.append(f"**Total Spots:** 1-{total_spots}")
     
     # Winning numbers
     if len(numbers) == 1:
@@ -56,8 +50,16 @@ def create_winner_embed(numbers: list, request_count: int, request_limit: int,
         numbers_str = ", ".join(map(str, numbers))
         description_lines.append(f"**Winning Numbers:** {numbers_str}")
     
+    if reddit_info:
+        description_lines.append("")  # Empty line for spacing
+
+        # Author and Link on same line separated by |
+        description_lines.append(f"**Reddit Host:** [{reddit_info['author']}]({reddit_info['author_url']}) | [Raffle Link]({reddit_info['url']})")
+    else:
+        logger.warning("No Reddit info provided to embed")
+
     # Add winners section if spot assignments are available
-    if reddit_info and reddit_info.get('spot_assignments'):
+    if reddit_info and reddit_info.get('spot_assignments') and need_detailed_winners:
         spot_assignments = reddit_info['spot_assignments']
         description_lines.append("")  # Empty line for spacing
         description_lines.append("**Winners:**")
@@ -69,7 +71,7 @@ def create_winner_embed(numbers: list, request_count: int, request_limit: int,
                 description_lines.append(f"{number} - [{username}](https://reddit.com/u/{username})")
             else:
                 description_lines.append(f"{number} - {username}")
-    
+
     embed.description = "\n".join(description_lines)
     
     # Set image if available
@@ -92,13 +94,13 @@ def create_winner_embed(numbers: list, request_count: int, request_limit: int,
             # Format as requested with caller name (no "Called by" prefix)
             formatted_time = dt_est.strftime('%Y-%m-%d %I:%M %p')
             if caller_name:
-                footer_text = f"{formatted_time} | {caller_name}"
+                footer_text = f"Discord Bot Caller: {caller_name} | {formatted_time}"
             else:
                 footer_text = formatted_time
             embed.set_footer(text=footer_text)
         except:
             if caller_name:
-                embed.set_footer(text=f"{timestamp} | {caller_name}")
+                embed.set_footer(text=f"Discord Bot Caller: {caller_name} | {timestamp}")
             else:
                 embed.set_footer(text=timestamp)
     elif caller_name:
@@ -304,7 +306,7 @@ def create_verification_dm_embed(reddit_info: dict = None, numbers: list = None,
     
     if numbers:
         if len(numbers) == 1:
-            description_lines.append(f"**Winning Number:** {numbers[0]}")
+            description_lines.append(f"**Winning Numbers:** {numbers[0]}")
         else:
             numbers_str = ", ".join(map(str, numbers))
             description_lines.append(f"**Winning Numbers:** {numbers_str}")

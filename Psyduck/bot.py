@@ -347,6 +347,7 @@ async def process_call_command(
         random_data = result['random']
         signature = result['signature']
         numbers = random_data['data']
+        numbers.sort()
         
         # Get request count
         request_count, request_limit = random_org.get_total_requests()
@@ -357,6 +358,26 @@ async def process_call_command(
         # Get timestamp from Random.org response
         timestamp = random_data.get('completionTime', 'N/A')
         
+        # Add winners section if spot assignments are available
+        if reddit_info and reddit_info.get('spot_assignments'):
+            spot_assignments = reddit_info['spot_assignments']
+            winner_arr = []
+            for number in numbers:
+                username = spot_assignments.get(number, "Unknown")
+                # Create hyperlink to user's Reddit profile
+                if username != "Unknown":
+                    winner_arr.append(f"{number} - [{username}](https://reddit.com/u/{username})")
+                else:
+                    winner_arr.append(f"{number} - {username}")
+        
+            winning_content = "# **Winners:** " + " | ".join(winner_arr)
+        else:
+            winning_content = "# **Winning numbers:** " + " | ".join(numbers)
+
+        need_detailed_winners = len(winning_content) >= 256
+        if need_detailed_winners:
+            winning_content = "List of winners is too long. See desc. for details."
+
         # Create the embed
         embed = create_winner_embed(
             numbers,
@@ -365,12 +386,9 @@ async def process_call_command(
             reddit_info,
             timestamp,
             spots,
-            caller_name
+            caller_name,
+            need_detailed_winners
         )
-        
-        # Format winning numbers as message content
-        from utils import format_winning_message
-        winning_content = format_winning_message(numbers)
         
         # Create button view with verification data (uses database for persistence)
         view = VerificationButton(verification_db)
