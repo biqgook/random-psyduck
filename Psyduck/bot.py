@@ -29,11 +29,11 @@ load_dotenv()
 
 # Setup logging
 logging.basicConfig(
-    level=logging.WARNING,  # Only show warnings and errors
+    level=logging.INFO,  # show info, warnings, and errors
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('GloveAndHisBoy')
-logger.setLevel(logging.WARNING)  # Set our logger to WARNING too
+logger.setLevel(logging.INFO)  # Set our logger to WARNING too
 
 # Bot setup with intents
 intents = discord.Intents.default()
@@ -332,10 +332,9 @@ async def call_command(
     else:
         # Respond immediately with ephemeral message so interaction doesn't fail
         await interaction.response.send_message("🎲 Processing...", ephemeral=True)
-    
+
     # Add to queue with channel reference and caller user object
     await command_queue.add_to_queue(process_call_command, interaction.channel, reddit_url, spots, winners, interaction.user)
-
 
 async def process_call_command(
     channel: discord.TextChannel,
@@ -346,6 +345,9 @@ async def process_call_command(
 ):
     """Process the actual command execution"""
     caller_name = caller_user.display_name
+    links = load_links("called_links.txt")
+
+    logger.info(f'Processing call command. caller_name: {caller_name} | reddit_url: {reddit_url} | spots: {spots} | winners: {winners}')
     
     # Fetch Reddit post information
     reddit_info = None
@@ -354,6 +356,16 @@ async def process_call_command(
             reddit_info = await reddit_manager.get_post_info(reddit_url)
             if not reddit_info:
                 await channel.send("⚠️ Could not fetch Reddit post information, but continuing with number generation...")
+
+            link = reddit_info['url']
+            logger.info(f'links: {links}')
+            if link not in links:
+                links.add(link)
+                with open("called_links.txt", "a", encoding="utf-8") as f:
+                    f.write(link + "\n")
+            else:
+                await channel.send("⚠️  This raffle appears to have its results be called already. If you believe there is a mistake, please message Dasxce.")
+                return
         except Exception as e:
             logger.exception(f"Error fetching Reddit info: {e}")
             await channel.send("⚠️ Error fetching Reddit post, but continuing with number generation...")
@@ -523,6 +535,10 @@ async def on_error(event, *args, **kwargs):
     logger.exception(f"Error in {event}")
 
 
+def load_links(path):
+    with open(path, encoding="utf-8") as f:
+        return {line.strip() for line in f}
+    
 def main():
     """Main entry point"""
     # Get Discord token
