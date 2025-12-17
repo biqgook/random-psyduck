@@ -3,6 +3,10 @@
 
 # Database
 verification_data.db
+reddit_links.db
+
+# Duplicate prevention tracking
+called_links.txt
 
 # Python
 __pycache__/

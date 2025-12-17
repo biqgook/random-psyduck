@@ -1,8 +1,3 @@
-"""
-GloveAndHisBoy Discord Bot - Random Number Generator with Verification
-Main bot file
-"""
-
 import argparse
 import discord
 from discord import app_commands
@@ -11,17 +6,22 @@ import logging
 import os
 import asyncio
 from dotenv import load_dotenv
-
 import config
 from random_org import RandomOrgManager
 from database import VerificationDatabase
+from link_database import LinkDatabase
 from reddit_manager import RedditManager
 from queue_manager import CommandQueue
 from roll_logger import RollLogger
+from link_view import LinkButton
+from cleanup_handlers import startup_cleanup, cleanup_user_messages, cleanup_everything
+from command_handler import process_call_command
 from utils import (
     create_winner_embed,
     validate_parameters,
-    VerificationButton
+    VerificationButton,
+    match_reddit_to_discord_user,
+    format_timestamp_est
 )
 
 # Load environment variables
@@ -29,18 +29,22 @@ load_dotenv()
 
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO,  # show info, warnings, and errors
+    level=logging.WARNING,  # Only show warnings and errors
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger('GloveAndHisBoy')
-logger.setLevel(logging.INFO)  # Set our logger to WARNING too
+logger = logging.getLogger('Psyduck')
+logger.setLevel(logging.WARNING)  # Set our logger to WARNING too
 
 # Bot setup with intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
+intents.members = True  
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="-", intents=intents)
+
+# File lock for thread-safe access to called_links.txt
+called_links_lock = asyncio.Lock()
 
 # Initialize Random.org manager with API keys
 api_keys = [
@@ -62,6 +66,9 @@ random_org = RandomOrgManager(api_keys)
 # Initialize verification database
 verification_db = VerificationDatabase()
 
+# Initialize link database (separate from verification db)
+link_db = LinkDatabase()
+
 # Initialize command queue with 5-second delay
 command_queue = CommandQueue(delay_seconds=config.COMMAND_QUEUE_DELAY)
 
@@ -81,6 +88,7 @@ args = parser.parse_args()
 guild_id_str = os.getenv('TESTING_GUILD_ID')
 allow_id = config.ALLOWED_CHANNEL_ID
 roll_id = config.ROLL_LOG_CHANNEL_ID
+general_chat_id = config.PR_GENERAL_CHAT
 if args.env != "pokemon":
     guild_id_str = os.getenv('LR_GUILD_ID')
     allow_id = config.LR_ALLOWED_CHANNEL_ID
@@ -110,6 +118,8 @@ async def on_ready():
     
     # Register persistent views for buttons
     bot.add_view(VerificationButton(verification_db))
+    bot.add_view(LinkButton(link_db))
+    logger.info("Registered persistent button views")
 
     # Sync commands to the guild (this clears and re-registers, preventing duplicates)
     try:
@@ -129,7 +139,7 @@ async def on_ready():
         channel = bot.get_channel(allow_id)
         if channel:
             logger.info("Starting startup cleanup of user messages...")
-            await startup_cleanup(channel)
+            await startup_cleanup(channel, bot.user.id)
         else:
             logger.warning(f"Could not find channel {allow_id} for startup cleanup")
     except Exception as e:
@@ -145,7 +155,6 @@ async def on_ready():
             logger.warning(f"Could not find roll log channel {roll_id}")
     except Exception as e:
         logger.exception(f"Error initializing roll logger: {e}")
-        logger.exception(f"Error during startup cleanup: {e}")
 
 
 @bot.event
@@ -167,7 +176,7 @@ async def on_message(message):
             # Admin cleanup commands
             if msg_content == "-c":
                 logger.info("Admin '-c' (clean) command detected")
-                await cleanup_user_messages(message.channel, message)
+                await cleanup_user_messages(message.channel, message, bot.user.id)
                 return
             elif msg_content == "-e":
                 logger.info("Admin '-e' (everything) command detected")
@@ -198,109 +207,16 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
-async def startup_cleanup(channel: discord.TextChannel):
-    """Clean up user messages on bot startup"""
-    try:
-        deleted_count = 0
-        async for msg in channel.history(limit=100):  # Check last 100 messages
-            # Delete messages that are not from bot or admin
-            if msg.author.id != bot.user.id and msg.author.id != config.ADMIN_USER_ID:
-                try:
-                    await msg.delete()
-                    deleted_count += 1
-                    # Rate limit protection
-                    await asyncio.sleep(0.5)
-                except discord.errors.NotFound:
-                    pass
-                except discord.errors.Forbidden:
-                    logger.error(f"Missing permissions to delete message {msg.id}")
-                except Exception as e:
-                    logger.exception(f"Error deleting message {msg.id}: {e}")
-        
-        if deleted_count > 0:
-            logger.info(f"Startup cleanup complete - removed {deleted_count} user messages")
-        else:
-            logger.info("Startup cleanup complete - no user messages found")
-            
-    except Exception as e:
-        logger.exception(f"Error during startup cleanup: {e}")
-
-
-async def cleanup_user_messages(channel: discord.TextChannel, trigger_message: discord.Message):
-    """Delete all messages except bot and admin messages"""
-    try:
-        await trigger_message.delete()  # Delete the "Clean up" command
-        logger.info(f"Starting cleanup - removing user messages only")
-        
-        deleted_count = 0
-        async for msg in channel.history(limit=500):  # Limit to last 500 messages
-            # Keep bot messages and admin messages
-            if msg.author.id != bot.user.id and msg.author.id != config.ADMIN_USER_ID:
-                try:
-                    await msg.delete()
-                    deleted_count += 1
-                    # Rate limit protection: wait between deletions
-                    await asyncio.sleep(0.5)  # 2 deletions per second
-                except discord.errors.NotFound:
-                    pass  # Message already deleted
-                except discord.errors.Forbidden:
-                    logger.error(f"Missing permissions to delete message {msg.id}")
-                except Exception as e:
-                    logger.exception(f"Error deleting message {msg.id}: {e}")
-        
-        logger.info(f"Cleanup complete - deleted {deleted_count} user messages")
-        
-        # Send confirmation (will auto-delete after 5 seconds)
-        confirm_msg = await channel.send(f"✅ Cleaned up {deleted_count} user messages")
-        await asyncio.sleep(5)
-        await confirm_msg.delete()
-        
-    except Exception as e:
-        logger.exception(f"Error during cleanup: {e}")
-
-
-async def cleanup_everything(channel: discord.TextChannel, trigger_message: discord.Message):
-    """Delete all messages including bot messages and admin messages"""
-    try:
-        logger.info(f"Starting full cleanup - removing ALL messages (including bot and admin)")
-        
-        # Don't delete the trigger message first - let it be deleted in the loop
-        deleted_count = 0
-        failed_count = 0
-        
-        async for msg in channel.history(limit=500):  # Limit to last 500 messages
-            try:
-                logger.debug(f"Deleting message {msg.id} from {msg.author.name}")
-                await msg.delete()
-                deleted_count += 1
-                # Rate limit protection: wait between deletions
-                await asyncio.sleep(0.5)  # 2 deletions per second
-            except discord.errors.NotFound:
-                logger.debug(f"Message {msg.id} already deleted")
-                pass  # Message already deleted
-            except discord.errors.Forbidden:
-                logger.error(f"Missing permissions to delete message {msg.id}")
-                failed_count += 1
-            except Exception as e:
-                logger.exception(f"Error deleting message {msg.id}: {e}")
-                failed_count += 1
-        
-        logger.info(f"Full cleanup complete - deleted {deleted_count} messages, {failed_count} failed")
-        
-    except Exception as e:
-        logger.exception(f"Error during full cleanup: {e}")
-
-
 @bot.tree.command(name="call", description="Generate random winner(s) for a raffle")
 @app_commands.describe(
     reddit_url="Reddit post URL for the raffle",
-    spots="Total number of spots in the raffle",
+    spots="Total number of spots (optional - will parse from Reddit title if not provided)",
     winners="Number of winners to select (default: 1)"
 )
 async def call_command(
     interaction: discord.Interaction,
     reddit_url: str,
-    spots: int,
+    spots: int = None,
     winners: int = 1
 ):
     """Slash command to generate random winners"""
@@ -313,11 +229,16 @@ async def call_command(
         )
         return
     
-    # Validate parameters
-    is_valid, error_message = validate_parameters(winners, spots)
-    if not is_valid:
-        await interaction.response.send_message(f"❌ {error_message}", ephemeral=True)
-        return
+    # If spots not provided, we'll parse it from Reddit title later
+    # For now, just validate winners if spots is provided
+    if spots is not None:
+        is_valid, error_message = validate_parameters(winners, spots)
+        if not is_valid:
+            # Silent error - notify admin only
+            from command_handler import send_error_to_admin
+            await send_error_to_admin(bot, interaction.user, f"Invalid command parameters: {error_message} (spots={spots}, winners={winners})")
+            await interaction.response.send_message("🎲 Processing...", ephemeral=True)
+            return
     
     # Check queue position
     queue_position = command_queue.get_queue_position()
@@ -332,190 +253,25 @@ async def call_command(
     else:
         # Respond immediately with ephemeral message so interaction doesn't fail
         await interaction.response.send_message("🎲 Processing...", ephemeral=True)
-
-    # Add to queue with channel reference and caller user object
-    await command_queue.add_to_queue(process_call_command, interaction.channel, reddit_url, spots, winners, interaction.user)
-
-async def process_call_command(
-    channel: discord.TextChannel,
-    reddit_url: str,
-    spots: int,
-    winners: int,
-    caller_user: discord.User
-):
-    """Process the actual command execution"""
-    caller_name = caller_user.display_name
-    links = load_links("called_links.txt")
-
-    logger.info(f'Processing call command. caller_name: {caller_name} | reddit_url: {reddit_url} | spots: {spots} | winners: {winners}')
     
-    # Fetch Reddit post information
-    reddit_info = None
-    if reddit_manager:
-        try:
-            reddit_info = await reddit_manager.get_post_info(reddit_url)
-            if not reddit_info:
-                await channel.send("⚠️ Could not fetch Reddit post information, but continuing with number generation...")
-
-            link = reddit_info['url']
-            logger.info(f'links: {links}')
-            if link not in links:
-                links.add(link)
-                with open("called_links.txt", "a", encoding="utf-8") as f:
-                    f.write(link + "\n")
-            else:
-                await channel.send("⚠️  This raffle appears to have its results be called already. If you believe there is a mistake, please message Dasxce.")
-                return
-        except Exception as e:
-            logger.exception(f"Error fetching Reddit info: {e}")
-            await channel.send("⚠️ Error fetching Reddit post, but continuing with number generation...")
-    
-    try:
-        # Generate random numbers (will retry every 5 minutes if API is down)
-        result = await random_org.generate_random_numbers(winners, spots)
-        
-        # Extract data from result
-        random_data = result['random']
-        signature = result['signature']
-        numbers = random_data['data']
-        
-        # Get request count
-        request_count, request_limit = random_org.get_total_requests()
-        
-        # Format verification data
-        verification_json = random_org.format_verification_data(random_data)
-        
-        # Get timestamp from Random.org response
-        timestamp = random_data.get('completionTime', 'N/A')
-        
-        # Add winners section if spot assignments are available
-        if reddit_info and reddit_info.get('spot_assignments'):
-            spot_assignments = reddit_info['spot_assignments']
-            winner_arr = []
-            for number in numbers:
-                username = spot_assignments.get(number, "Unknown")
-                # Create hyperlink to user's Reddit profile
-                if username != "Unknown":
-                    winner_arr.append(f"{number} - [{username}](https://reddit.com/u/{username})")
-                else:
-                    winner_arr.append(f"{number} - {username}")
-        
-            winning_content = "# **Winners:** " + " | ".join(winner_arr)
-        else:
-            winning_content = "# **Winning numbers:** " + " | ".join(numbers)
-
-        need_detailed_winners = len(winning_content) >= 256
-        if need_detailed_winners:
-            winning_content = "List of winners is too long. See desc. for details."
-
-        # Create the embed
-        embed = create_winner_embed(
-            numbers,
-            request_count,
-            request_limit,
-            reddit_info,
-            timestamp,
-            spots,
-            caller_name,
-            need_detailed_winners
-        )
-        
-        # Create button view with verification data (uses database for persistence)
-        view = VerificationButton(verification_db)
-        
-        # Send the response with button (winning numbers as content, info as embed)
-        response_message = await channel.send(content=winning_content, embed=embed, view=view)
-        
-        # Log numbers to roll history
-        try:
-            roll_log_channel = bot.get_channel(roll_id)
-            if roll_log_channel:
-                await roll_logger.log_roll(roll_log_channel, numbers)
-            else:
-                logger.warning(f"Roll log channel {roll_id} not found")
-        except Exception as e:
-            logger.exception(f"Error logging roll to history: {e}")
-        
-        # Store verification data in database using the response message ID
-        verification_db.store_verification(
-            response_message.id,
-            verification_json,
-            signature,
-            numbers,
-            reddit_info,
-            timestamp,
-            spots,
-            caller_name
-        )
-        
-        logger.info(f"Successfully sent {len(numbers)} number(s) to channel {channel.id}")
-        
-        # Send DM to caller with results and message link
-        try:
-            dm_embed = discord.Embed(
-                title="Record",
-                description=f"[Discord Link]({response_message.jump_url})",
-                color=config.EMBED_COLOR
-            )
-            
-            # Add the same information as the main embed
-            if reddit_info:
-                dm_embed.add_field(
-                    name="Raffle",
-                    value=f"[{reddit_info['author']}]({reddit_info['author_url']}) | [Link]({reddit_info['url']})",
-                    inline=False
-                )
-            
-            dm_embed.add_field(name="Spots", value=f"1-{spots}", inline=True)
-            
-            if len(numbers) == 1:
-                dm_embed.add_field(name="Winning Number", value=str(numbers[0]), inline=True)
-            else:
-                dm_embed.add_field(name="Winning Numbers", value=", ".join(map(str, numbers)), inline=True)
-            
-            # Add winners if available
-            if reddit_info and reddit_info.get('spot_assignments'):
-                spot_assignments = reddit_info['spot_assignments']
-                winners_list = []
-                for number in numbers:
-                    username = spot_assignments.get(number, "Unknown")
-                    if username != "Unknown":
-                        winners_list.append(f"{number} - [{username}](https://reddit.com/u/{username})")
-                    else:
-                        winners_list.append(f"{number} - {username}")
-                
-                if winners_list:
-                    dm_embed.add_field(name="Winners", value="\n".join(winners_list), inline=False)
-            
-            # Set image if available
-            if reddit_info and reddit_info.get('image_url'):
-                dm_embed.set_image(url=reddit_info['image_url'])
-            
-            # Set footer with timestamp
-            if timestamp:
-                from datetime import datetime
-                import pytz
-                try:
-                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                    est = pytz.timezone('US/Eastern')
-                    dt_est = dt.astimezone(est)
-                    formatted_time = dt_est.strftime('%Y-%m-%d %I:%M %p')
-                    dm_embed.set_footer(text=formatted_time)
-                except:
-                    pass
-            
-            await caller_user.send(embed=dm_embed)
-            logger.info(f"Sent results DM to {caller_user.name}")
-            
-        except discord.Forbidden:
-            logger.warning(f"Could not send DM to {caller_user.name} - DMs disabled")
-        except Exception as e:
-            logger.exception(f"Error sending DM to caller: {e}")
-        
-    except Exception as e:
-        # Send error message
-        await channel.send("❌ An unexpected error occurred. Please try again later.")
-        logger.exception(f"Error processing command: {e}")
+    # Add to queue with all necessary parameters
+    await command_queue.add_to_queue(
+        process_call_command,
+        interaction.channel,
+        reddit_url,
+        spots,
+        winners,
+        interaction.user,
+        bot,
+        random_org,
+        reddit_manager,
+        verification_db,
+        link_db,
+        roll_logger,
+        roll_id,
+        general_chat_id,
+        interaction
+    )
 
 
 @bot.event
@@ -536,9 +292,21 @@ async def on_error(event, *args, **kwargs):
 
 
 def load_links(path):
-    with open(path, encoding="utf-8") as f:
-        return {line.strip() for line in f}
-    
+    """Load called links from file with proper error handling"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        logger.warning(f"Links file {path} not found, creating new one")
+        # Create empty file
+        with open(path, "w", encoding="utf-8") as f:
+            pass
+        return set()
+    except Exception as e:
+        logger.exception(f"Error loading links from {path}: {e}")
+        return set()
+
+
 def main():
     """Main entry point"""
     # Get Discord token
