@@ -1,7 +1,3 @@
-"""
-Roll Logger module for tracking daily roll history
-"""
-
 import discord
 import logging
 from datetime import datetime
@@ -9,7 +5,7 @@ from typing import Dict, Optional
 import json
 import pytz
 
-logger = logging.getLogger('GloveAndHisBoy')
+logger = logging.getLogger('Psyduck')
 
 
 class RollLogger:

@@ -1,7 +1,3 @@
-"""
-Random.org API integration with key rotation and request tracking
-"""
-
 import json
 import requests
 import uuid
@@ -12,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Tuple, Optional, Dict
 import config
 
-logger = logging.getLogger('GloveAndHisBoy')
+logger = logging.getLogger('Psyduck')
 
 
 class RandomOrgManager:
@@ -106,12 +102,12 @@ class RandomOrgManager:
                 response_data = response.json()
                 
                 if response_data and 'result' in response_data:
-                    # Increment counter for this key
+                    # Only increment counter for this key on SUCCESS
                     self.request_counts[api_key] = self.request_counts.get(api_key, 0) + 1
                     
                     if attempt > 1:
                         logger.info(f"Successfully generated numbers after {attempt} attempts")
-                    logger.info(f"Generated {count} random number(s) from 1-{max_value}")
+                    logger.info(f"Generated {count} random number(s) from 1-{max_value} using key #{self.api_keys.index(api_key) + 1}")
                     return response_data['result']
                 else:
                     logger.warning(f"Invalid response from Random.org (attempt {attempt}): {response_data}")

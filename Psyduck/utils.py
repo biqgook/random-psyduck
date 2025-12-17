@@ -1,15 +1,75 @@
-"""
-Utility functions for formatting Discord messages and embeds
-"""
-
 import discord
 import io
 import json
 import base64
 import logging
 import config
+import re
+from functools import lru_cache
 
-logger = logging.getLogger('GloveAndHisBoy')
+logger = logging.getLogger('Psyduck')
+
+
+# Cache for normalized member names to improve fuzzy matching performance
+# Key: (member_id, name_type), Value: normalized_name
+_member_name_cache = {}
+
+
+def _get_normalized_member_names(member: discord.Member) -> tuple:
+    """
+    Get cached normalized names for a member
+    
+    Returns:
+        Tuple of (normalized_display_name, normalized_username)
+    """
+    cache_key = member.id
+    if cache_key not in _member_name_cache:
+        # Remove emojis, special characters, and normalize
+        # Keep only alphanumeric characters
+        display_clean = re.sub(r'[^a-z0-9]', '', member.display_name.lower())
+        name_clean = re.sub(r'[^a-z0-9]', '', member.name.lower())
+        _member_name_cache[cache_key] = (display_clean, name_clean)
+    
+    return _member_name_cache[cache_key]
+
+
+def clear_member_cache():
+    """Clear the member name cache (useful for testing or after guild updates)"""
+    global _member_name_cache
+    _member_name_cache = {}
+
+
+def format_timestamp_est(timestamp: str, caller_name: str = None) -> str:
+    """
+    Format ISO timestamp to EST timezone with optional caller name
+    
+    Args:
+        timestamp: ISO format timestamp string
+        caller_name: Optional Discord username to include
+        
+    Returns:
+        Formatted timestamp string for footer
+    """
+    from datetime import datetime
+    import pytz
+    
+    try:
+        # Parse ISO timestamp
+        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        # Convert to EST
+        est = pytz.timezone('US/Eastern')
+        dt_est = dt.astimezone(est)
+        # Format as requested
+        formatted_time = dt_est.strftime('%Y-%m-%d %I:%M %p')
+        
+        if caller_name:
+            return f"Discord Bot Caller: {caller_name} | {formatted_time}"
+        return formatted_time
+    except Exception as e:
+        logger.warning(f"Error formatting timestamp: {e}")
+        if caller_name:
+            return f"Discord Bot Caller: {caller_name} | {timestamp}"
+        return timestamp
 
 
 def create_winner_embed(numbers: list, request_count: int, request_limit: int, 
@@ -65,7 +125,8 @@ def create_winner_embed(numbers: list, request_count: int, request_limit: int,
         description_lines.append("**Winners:**")
         
         for number in numbers:
-            username = spot_assignments.get(number, "Unknown")
+            # Try both int and string keys (int for fresh data, string for JSON-deserialized data)
+            username = spot_assignments.get(number, spot_assignments.get(str(number), "Unknown"))
             # Create hyperlink to user's Reddit profile
             if username != "Unknown":
                 description_lines.append(f"{number} - [{username}](https://reddit.com/u/{username})")
@@ -83,26 +144,8 @@ def create_winner_embed(numbers: list, request_count: int, request_limit: int,
     
     # Format timestamp to EST and set as footer with caller name
     if timestamp:
-        from datetime import datetime
-        import pytz
-        try:
-            # Parse ISO timestamp
-            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            # Convert to EST
-            est = pytz.timezone('US/Eastern')
-            dt_est = dt.astimezone(est)
-            # Format as requested with caller name (no "Called by" prefix)
-            formatted_time = dt_est.strftime('%Y-%m-%d %I:%M %p')
-            if caller_name:
-                footer_text = f"Discord Bot Caller: {caller_name} | {formatted_time}"
-            else:
-                footer_text = formatted_time
-            embed.set_footer(text=footer_text)
-        except:
-            if caller_name:
-                embed.set_footer(text=f"Discord Bot Caller: {caller_name} | {timestamp}")
-            else:
-                embed.set_footer(text=timestamp)
+        footer_text = format_timestamp_est(timestamp, caller_name)
+        embed.set_footer(text=footer_text)
     elif caller_name:
         embed.set_footer(text=caller_name)
     
@@ -170,36 +213,94 @@ def parse_command(message_content: str, bot_user_id: int) -> tuple:
         return (None, None)
 
 
-def validate_parameters(count: int, max_value: int) -> tuple:
+def validate_parameters(winners: int, spots: int) -> tuple:
     """
     Validate the command parameters
     
     Args:
-        count: Number of winners to pick
-        max_value: Maximum value in range
+        winners: Number of winners to pick
+        spots: Total number of spots in the raffle
         
     Returns:
         Tuple of (is_valid, error_message)
     """
-    if count is None or max_value is None:
-        return (False, "Invalid command format. Use `@GloveAndHisBoy <number>` or `@GloveAndHisBoy <count> <max>`")
+    if winners is None or spots is None:
+        return (False, "Invalid command parameters")
     
-    if count < 1:
-        return (False, "Count must be at least 1")
+    if winners < 1:
+        return (False, "Number of winners must be at least 1")
     
-    if max_value < 1:
-        return (False, "Maximum value must be at least 1")
+    if spots < 2:
+        return (False, "Number of spots must be at least 2")
     
-    if count > max_value:
-        return (False, f"Cannot pick {count} unique numbers from a range of 1-{max_value}")
+    if winners > spots:
+        return (False, f"Cannot pick {winners} unique winners from {spots} spots")
     
-    if max_value > 1000000:
-        return (False, "Maximum value cannot exceed 1,000,000")
+    if spots > config.MAX_SPOTS:
+        return (False, f"Maximum spots cannot exceed {config.MAX_SPOTS:,}")
     
-    if count > 10000:
-        return (False, "Cannot pick more than 10,000 numbers at once")
+    if winners > config.MAX_WINNERS:
+        return (False, f"Cannot pick more than {config.MAX_WINNERS:,} winners at once")
     
     return (True, None)
+
+
+def match_reddit_to_discord_user(reddit_username: str, guild_members: list) -> discord.Member:
+    """
+    Match a Reddit username to a Discord guild member using fuzzy matching.
+    Handles Discord usernames with emojis and decorations.
+    Uses caching to improve performance on large servers.
+    
+    Args:
+        reddit_username: Reddit username to match (full username, not truncated)
+        guild_members: List of Discord guild members
+        
+    Returns:
+        Discord Member object if found, None otherwise
+    """
+    # Normalize Reddit username - remove u/ prefix if present and lowercase
+    reddit_clean = reddit_username.lower().replace('u/', '').replace('_', '').replace('-', '')
+    
+    best_match = None
+    best_score = 0
+    
+    for member in guild_members:
+        # Skip bots
+        if member.bot:
+            continue
+        
+        # Get cached normalized names
+        display_clean, name_clean = _get_normalized_member_names(member)
+        
+        # Check both display_name and name (username)
+        for discord_clean in [display_clean, name_clean]:
+            # Skip if either name is too short
+            if len(discord_clean) < config.MIN_MATCH_LENGTH or len(reddit_clean) < config.MIN_MATCH_LENGTH:
+                continue
+            
+            # Exact match after normalization
+            if discord_clean == reddit_clean:
+                return member
+            
+            # Check if reddit username is contained in discord name
+            if reddit_clean in discord_clean and len(reddit_clean) >= config.MIN_MATCH_LENGTH:
+                score = len(reddit_clean) / len(discord_clean)
+                if score > best_score:
+                    best_score = score
+                    best_match = member
+            
+            # Check if discord name is contained in reddit username
+            if discord_clean in reddit_clean and len(discord_clean) >= config.MIN_MATCH_LENGTH:
+                score = len(discord_clean) / len(reddit_clean)
+                if score > best_score:
+                    best_score = score
+                    best_match = member
+    
+    # Return best match if score is good enough
+    if best_score >= config.MIN_MATCH_SCORE:
+        return best_match
+    
+    return None
 
 
 def create_verification_file(numbers: list, verification_random: str, signature: str) -> io.BytesIO:
@@ -276,9 +377,10 @@ https://www.random.org/faq/#Q4.3
 
 def create_verification_dm_embed(reddit_info: dict = None, numbers: list = None, 
                                  total_spots: int = None, timestamp: str = None, 
-                                 caller_name: str = None) -> discord.Embed:
+                                 caller_name: str = None, verification_random: str = None,
+                                 signature: str = None) -> tuple:
     """
-    Create embed for DM with verification instructions and raffle info
+    Create embed(s) for DM with verification instructions and raffle info
     
     Args:
         reddit_info: Reddit post information
@@ -286,9 +388,11 @@ def create_verification_dm_embed(reddit_info: dict = None, numbers: list = None,
         total_spots: Total number of spots
         timestamp: Timestamp of the call
         caller_name: Name of user who called the command
+        verification_random: Random.org verification JSON data
+        signature: Random.org signature
     
     Returns:
-        Discord Embed object
+        Tuple of (main_embed, verification_embed or None)
     """
     embed = discord.Embed(
         title="🔐 Verification Data",
@@ -318,50 +422,99 @@ def create_verification_dm_embed(reddit_info: dict = None, numbers: list = None,
         description_lines.append("**Winners:**")
         
         for number in numbers:
-            username = spot_assignments.get(number, "Unknown")
+            # Try both int and string keys (int for fresh data, string for JSON-deserialized data)
+            username = spot_assignments.get(number, spot_assignments.get(str(number), "Unknown"))
             if username != "Unknown":
                 description_lines.append(f"{number} - [{username}](https://reddit.com/u/{username})")
             else:
                 description_lines.append(f"{number} - {username}")
     
-    description_lines.append("")
-    description_lines.append("**Verification Instructions:**")
-    description_lines.append("1. Download the attached `.txt` file")
-    description_lines.append("2. Open it and follow the instructions inside")
-    description_lines.append("3. Visit [Random.org Verification](https://api.random.org/verify)")
-    description_lines.append("4. Copy/paste the data as instructed")
-    description_lines.append("")
-    description_lines.append("This proves the numbers were genuinely random and unmodified!")
+    # Calculate if we need separate embed for verification
+    # Estimate size: description + verification fields (Random Data ~800 chars, Signature ~350 chars)
+    description_text = "\n".join(description_lines)
+    verification_fields_size = len(verification_random or "") + len(signature or "") + 200  # +200 for field names and formatting
     
-    embed.description = "\n".join(description_lines)
+    # Discord limits: description 4096 chars, total embed ~6000 chars
+    # If description + verification would be too large, split into separate embed
+    needs_separate_verification = (len(description_text) + verification_fields_size) > 3500
     
-    # Set image if available
+    verification_embed = None
+    
+    if needs_separate_verification:
+        # Don't add verification instructions to main embed
+        embed.description = description_text
+        
+        # Create separate verification embed
+        verification_embed = discord.Embed(
+            title="🔐 Verification Instructions",
+            color=config.EMBED_COLOR
+        )
+        
+        verification_instructions = [
+            "**How to Verify:**",
+            "1. Visit [Random.org Verification](https://api.random.org/verify)",
+            "2. Copy **Random Data** below → Paste in first field",
+            "3. Copy **Signature** below → Paste in second field",
+            "4. Click Verify ✅",
+            "",
+            "This proves the numbers were genuinely random and unmodified!"
+        ]
+        verification_embed.description = "\n".join(verification_instructions)
+        
+        # Add verification fields to separate embed
+        if verification_random:
+            verification_embed.add_field(
+                name="Random Data",
+                value=f"```json\n{verification_random}\n```",
+                inline=False
+            )
+        
+        if signature:
+            verification_embed.add_field(
+                name="Signature",
+                value=f"```\n{signature}\n```",
+                inline=False
+            )
+    else:
+        # Add verification instructions to main embed
+        description_lines.append("")
+        description_lines.append("**Verification Instructions:**")
+        description_lines.append("1. Visit [Random.org Verification](https://api.random.org/verify)")
+        description_lines.append("2. Copy **Random Data** below → Paste in first field")
+        description_lines.append("3. Copy **Signature** below → Paste in second field")
+        description_lines.append("4. Click Verify ✅")
+        description_lines.append("")
+        description_lines.append("This proves the numbers were genuinely random and unmodified!")
+        
+        embed.description = "\n".join(description_lines)
+        
+        # Add verification fields to main embed
+        if verification_random:
+            embed.add_field(
+                name="Random Data",
+                value=f"```json\n{verification_random}\n```",
+                inline=False
+            )
+        
+        if signature:
+            embed.add_field(
+                name="Signature",
+                value=f"```\n{signature}\n```",
+                inline=False
+            )
+    
+    # Set image if available (only on main embed)
     if reddit_info and reddit_info.get('image_url'):
         embed.set_image(url=reddit_info['image_url'])
     
     # Set footer with timestamp and caller
     if timestamp:
-        from datetime import datetime
-        import pytz
-        try:
-            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            est = pytz.timezone('US/Eastern')
-            dt_est = dt.astimezone(est)
-            formatted_time = dt_est.strftime('%Y-%m-%d %I:%M %p')
-            if caller_name:
-                footer_text = f"{formatted_time} | {caller_name}"
-            else:
-                footer_text = formatted_time
-            embed.set_footer(text=footer_text)
-        except:
-            if caller_name:
-                embed.set_footer(text=f"{timestamp} | {caller_name}")
-            else:
-                embed.set_footer(text=timestamp)
+        footer_text = format_timestamp_est(timestamp, caller_name)
+        embed.set_footer(text=footer_text)
     elif caller_name:
         embed.set_footer(text=caller_name)
     
-    return embed
+    return (embed, verification_embed)
 
 
 class VerificationButton(discord.ui.View):
@@ -386,34 +539,24 @@ class VerificationButton(discord.ui.View):
                 )
                 return
             
-            # Create the verification file
-            file_content = create_verification_file(
-                data['numbers'],
-                data['verification_random'],
-                data['signature']
-            )
-            
-            # Create Discord file
-            discord_file = discord.File(
-                fp=file_content,
-                filename=f"verification_data_{interaction.id}.txt"
-            )
-            
-            # Create DM embed with all raffle information
-            dm_embed = create_verification_dm_embed(
+            # Create DM embed(s) with all raffle information and verification data
+            dm_embed, verification_embed = create_verification_dm_embed(
                 reddit_info=data.get('reddit_info'),
                 numbers=data['numbers'],
                 total_spots=data.get('total_spots'),
                 timestamp=data.get('timestamp'),
-                caller_name=data.get('caller_name')
+                caller_name=data.get('caller_name'),
+                verification_random=data['verification_random'],
+                signature=data['signature']
             )
             
             # Send DM to user
             try:
-                await interaction.user.send(
-                    embed=dm_embed,
-                    file=discord_file
-                )
+                await interaction.user.send(embed=dm_embed)
+                
+                # If verification data is in separate embed, send it as well
+                if verification_embed:
+                    await interaction.user.send(embed=verification_embed)
                 
                 # Respond to interaction
                 await interaction.response.send_message(
@@ -433,5 +576,5 @@ class VerificationButton(discord.ui.View):
                 ephemeral=True
             )
             import logging
-            logging.getLogger('GloveAndHisBoy').exception(f"Error in verification button: {e}")
+            logging.getLogger('Psyduck').exception(f"Error in verification button: {e}")
 

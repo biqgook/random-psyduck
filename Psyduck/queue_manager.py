@@ -1,13 +1,9 @@
-"""
-Queue manager for handling command requests with delays
-"""
-
 import asyncio
 import logging
 from typing import Callable, Any
 from datetime import datetime
 
-logger = logging.getLogger('GloveAndHisBoy')
+logger = logging.getLogger('Psyduck')
 
 
 class CommandQueue:
