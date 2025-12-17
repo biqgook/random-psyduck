@@ -366,7 +366,6 @@ async def process_call_command(
         random_data = result['random']
         signature = result['signature']
         numbers = random_data['data']
-        numbers.sort()
         
         # Get request count
         request_count, request_limit = random_org.get_total_requests()
