@@ -21,7 +21,8 @@ from roll_logger import RollLogger
 from utils import (
     create_winner_embed,
     validate_parameters,
-    VerificationButton
+    VerificationButton,
+    parse_spots_from_title
 )
 
 # Load environment variables
@@ -294,13 +295,13 @@ async def cleanup_everything(channel: discord.TextChannel, trigger_message: disc
 @bot.tree.command(name="call", description="Generate random winner(s) for a raffle")
 @app_commands.describe(
     reddit_url="Reddit post URL for the raffle",
-    spots="Total number of spots in the raffle",
+    spots="Total number of spots (optional - will parse from Reddit title if not provided)",
     winners="Number of winners to select (default: 1)"
 )
 async def call_command(
     interaction: discord.Interaction,
     reddit_url: str,
-    spots: int,
+    spots: int = None,
     winners: int = 1
 ):
     """Slash command to generate random winners"""
@@ -313,35 +314,108 @@ async def call_command(
         )
         return
     
+    # Defer response to allow time for Reddit fetch
+    await interaction.response.defer(ephemeral=True)
+    
+    # Fetch Reddit info first to validate spots
+    if not reddit_manager:
+        await interaction.followup.send(
+            "❌ Reddit manager not initialized. Cannot validate raffle.",
+            ephemeral=True
+        )
+        return
+    
+    try:
+        reddit_info = await reddit_manager.get_post_info(reddit_url)
+        if not reddit_info:
+            await interaction.followup.send(
+                "❌ Could not fetch Reddit post. Please verify the URL is correct.",
+                ephemeral=True
+            )
+            return
+    except Exception as e:
+        logger.exception(f"Error fetching Reddit info for validation: {e}")
+        await interaction.followup.send(
+            "❌ Error fetching Reddit post. Please try again.",
+            ephemeral=True
+        )
+        return
+    
+    # Parse spots from title
+    parsed_spots = parse_spots_from_title(reddit_info.get('title', ''))
+    
+    # Check for duplicate raffle BEFORE queuing
+    try:
+        reddit_permalink = reddit_info.get('url')
+        if reddit_permalink:
+            links = load_links("called_links.txt")
+            if reddit_permalink in links:
+                await interaction.followup.send(
+                    "❌ **This raffle has already been called**\n\n"
+                    "If you believe this is an error, please contact an admin.",
+                    ephemeral=True
+                )
+                return
+    except Exception as e:
+        logger.warning(f"Error checking duplicate links: {e}")
+        # Continue anyway - duplicate check failure shouldn't block raffle
+    
+    # Validate spots parameter
+    if spots is not None and parsed_spots is not None:
+        # User provided spots - validate against title
+        if spots != parsed_spots:
+            await interaction.followup.send(
+                f"❌ **Spot count doesn't match title**\n\n"
+                f"Reddit post has **{parsed_spots} spots**, but you entered **{spots}**.\n"
+                f"Please try again with the correct amount.",
+                ephemeral=True
+            )
+            return
+        logger.info(f"Spot validation passed: user input {spots} matches title {parsed_spots}")
+    elif spots is None and parsed_spots is not None:
+        # User didn't provide spots - use parsed value
+        spots = parsed_spots
+        logger.info(f"Auto-filled spots from title: {spots}")
+    elif spots is None and parsed_spots is None:
+        # Couldn't parse and user didn't provide
+        await interaction.followup.send(
+            "❌ **Could not determine spot count**\n\n"
+            "Could not parse spots from Reddit title. Please include the spots parameter.",
+            ephemeral=True
+        )
+        return
+    # else: spots provided, no parsed value - allow it (fallback case)
+    
     # Validate parameters
     is_valid, error_message = validate_parameters(winners, spots)
     if not is_valid:
-        await interaction.response.send_message(f"❌ {error_message}", ephemeral=True)
+        await interaction.followup.send(f"❌ {error_message}", ephemeral=True)
         return
     
     # Check queue position
     queue_position = command_queue.get_queue_position()
     
     if queue_position > 0:
-        # Send initial response with queue position (ephemeral so it doesn't clutter)
-        await interaction.response.send_message(
+        # Send response with queue position
+        await interaction.followup.send(
             f"⏳ Your request is queued. Position: **{queue_position + 1}**\n"
             f"*Please wait, processing will begin shortly...*",
             ephemeral=True
         )
     else:
-        # Respond immediately with ephemeral message so interaction doesn't fail
-        await interaction.response.send_message("🎲 Processing...", ephemeral=True)
+        # Confirm processing
+        await interaction.followup.send("🎲 Processing...", ephemeral=True)
 
-    # Add to queue with channel reference and caller user object
-    await command_queue.add_to_queue(process_call_command, interaction.channel, reddit_url, spots, winners, interaction.user)
+    # Add to queue with channel reference, caller user object, and pre-fetched reddit_info
+    await command_queue.add_to_queue(process_call_command, interaction.channel, reddit_url, spots, winners, interaction.user, reddit_info)
 
 async def process_call_command(
     channel: discord.TextChannel,
     reddit_url: str,
     spots: int,
     winners: int,
-    caller_user: discord.User
+    caller_user: discord.User,
+    reddit_info: dict = None
 ):
     """Process the actual command execution"""
     caller_name = caller_user.display_name
@@ -349,26 +423,31 @@ async def process_call_command(
 
     logger.info(f'Processing call command. caller_name: {caller_name} | reddit_url: {reddit_url} | spots: {spots} | winners: {winners}')
     
-    # Fetch Reddit post information
-    reddit_info = None
-    if reddit_manager:
+    # Use pre-fetched Reddit info if available (from validation), otherwise fetch
+    if reddit_info is None:
+        logger.info("Reddit info not pre-fetched, fetching now...")
+        if reddit_manager:
+            try:
+                reddit_info = await reddit_manager.get_post_info(reddit_url)
+                if not reddit_info:
+                    await channel.send("⚠️ Could not fetch Reddit post information, but continuing with number generation...")
+            except Exception as e:
+                logger.exception(f"Error fetching Reddit info: {e}")
+                await channel.send("⚠️ Error fetching Reddit post, but continuing with number generation...")
+    else:
+        logger.info("Using pre-fetched Reddit info from validation")
+    
+    # Mark raffle as called (duplicate already checked in /call command before queuing)
+    if reddit_info:
         try:
-            reddit_info = await reddit_manager.get_post_info(reddit_url)
-            if not reddit_info:
-                await channel.send("⚠️ Could not fetch Reddit post information, but continuing with number generation...")
-
             link = reddit_info['url']
-            logger.info(f'links: {links}')
-            if link not in links:
-                links.add(link)
-                with open("called_links.txt", "a", encoding="utf-8") as f:
-                    f.write(link + "\n")
-            else:
-                await channel.send("⚠️  This raffle appears to have its results be called already. If you believe there is a mistake, please message Dasxce.")
-                return
+            # Write to file immediately - duplicate was already checked before queuing
+            with open("called_links.txt", "a", encoding="utf-8") as f:
+                f.write(link + "\n")
+            logger.info(f"Marked raffle as called: {link}")
         except Exception as e:
-            logger.exception(f"Error fetching Reddit info: {e}")
-            await channel.send("⚠️ Error fetching Reddit post, but continuing with number generation...")
+            logger.exception(f"Error writing to called_links.txt: {e}")
+            # Continue - file write failure shouldn't stop raffle
     
     try:
         # Generate random numbers (will retry every 5 minutes if API is down)
@@ -391,18 +470,28 @@ async def process_call_command(
         # Add winners section if spot assignments are available
         if reddit_info and reddit_info.get('spot_assignments'):
             spot_assignments = reddit_info['spot_assignments']
+            user_spot_counts = reddit_info.get('user_spot_counts', {})
             winner_arr = []
             for number in numbers:
                 username = spot_assignments.get(number, "Unknown")
                 # Create hyperlink to user's Reddit profile
                 if username != "Unknown":
-                    winner_arr.append(f"{number} - [{username}](https://reddit.com/u/{username})")
+                    # Calculate percentage if available
+                    if username in user_spot_counts:
+                        user_spots = user_spot_counts[username]
+                        percentage = (user_spots / spots * 100) if spots > 0 else 0
+                        # Format percentage to remove trailing zeros (17.5% instead of 17.50%)
+                        percentage_str = f"{percentage:.1f}".rstrip('0').rstrip('.')
+                        winner_arr.append(f"{number} - [{username}](https://reddit.com/u/{username}) {percentage_str}%")
+                    else:
+                        winner_arr.append(f"{number} - [{username}](https://reddit.com/u/{username})")
                 else:
                     winner_arr.append(f"{number} - {username}")
         
             winning_content = "# **Winners:** " + " | ".join(winner_arr)
         else:
-            winning_content = "# **Winning numbers:** " + " | ".join(numbers)
+            # Convert numbers to strings for join
+            winning_content = "# **Winning numbers:** " + " | ".join(map(str, numbers))
 
         need_detailed_winners = len(winning_content) >= 256
         if need_detailed_winners:
@@ -536,8 +625,17 @@ async def on_error(event, *args, **kwargs):
 
 
 def load_links(path):
-    with open(path, encoding="utf-8") as f:
-        return {line.strip() for line in f}
+    """Load called links from file with proper error handling"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        logger.warning(f"Links file {path} not found, returning empty set")
+        return set()
+    except Exception as e:
+        logger.exception(f"Error loading links from {path}: {e}")
+        return set()
+
     
 def main():
     """Main entry point"""

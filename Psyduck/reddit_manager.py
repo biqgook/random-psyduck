@@ -156,9 +156,11 @@ class RedditManager:
                     spot_assignments, user_spot_counts = self._parse_spot_assignments(external_content)
                     logger.info(f"Parsed {len(spot_assignments)} spots from external slot list")
                 else:
-                    logger.warning("Failed to fetch external slot list, falling back to post body")
-                    spot_assignments, user_spot_counts = self._parse_spot_assignments(submission.selftext)
+                    # Don't fallback to post body - if external URL exists, spots won't be in description
+                    logger.error("Failed to fetch external slot list - returning empty assignments")
+                    spot_assignments, user_spot_counts = {}, {}
             else:
+                # No external URL found, parse from post body as normal
                 spot_assignments, user_spot_counts = self._parse_spot_assignments(submission.selftext)
             
             result = {
