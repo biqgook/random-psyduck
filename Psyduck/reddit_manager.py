@@ -7,6 +7,16 @@ import aiohttp
 logger = logging.getLogger('GloveAndHisBoy')
 
 
+class ExternalSlotListError(Exception):
+    """Raised when external slot list cannot be fetched but is required"""
+    pass
+
+
+class NoSpotAssignmentsError(Exception):
+    """Raised when no spot assignments can be found in post description"""
+    pass
+
+
 class RedditManager:
     def __init__(self, client_id: str, client_secret: str, user_agent: str, 
                  username: str, password: str):
@@ -37,7 +47,10 @@ class RedditManager:
                 user_agent=self.user_agent,
                 username=self.username,
                 password=self.password,
-                requestor_kwargs={"session": None}  # Let asyncpraw manage sessions
+                requestor_kwargs={
+                    "session": None,  # Let asyncpraw manage sessions
+                    "timeout": 30  # 30 second timeout for all requests
+                }
             )
             logger.info("Reddit API client connected")
     
@@ -157,11 +170,23 @@ class RedditManager:
                     logger.info(f"Parsed {len(spot_assignments)} spots from external slot list")
                 else:
                     # Don't fallback to post body - if external URL exists, spots won't be in description
-                    logger.error("Failed to fetch external slot list - returning empty assignments")
-                    spot_assignments, user_spot_counts = {}, {}
+                    logger.error("Failed to fetch external slot list")
+                    raise ExternalSlotListError(
+                        f"Could not fetch external slot list from {external_slot_url}. "
+                        "The raffle cannot proceed without valid spot assignments. "
+                        "Please verify the external link is accessible and try again."
+                    )
             else:
                 # No external URL found, parse from post body as normal
                 spot_assignments, user_spot_counts = self._parse_spot_assignments(submission.selftext)
+                # If no spots found in description, raise error
+                if not spot_assignments:
+                    logger.error("No spot assignments found in post description")
+                    raise NoSpotAssignmentsError(
+                        "No spot assignments found in the Reddit post description. "
+                        "The raffle may not have any participants yet, or the post format may be incorrect. "
+                        "Please verify the post has a participant list before calling the raffle."
+                    )
             
             result = {
                 'title': submission.title,
@@ -215,7 +240,7 @@ class RedditManager:
     
     async def _fetch_external_slot_list(self, url: str) -> Optional[str]:
         """
-        Fetch content from external slot list URL
+        Fetch content from external slot list URL with security checks
         
         Args:
             url: URL to fetch
@@ -223,16 +248,41 @@ class RedditManager:
         Returns:
             Text content of the slot list or None if error
         """
+        # Validate URL is from trusted domains
+        from urllib.parse import urlparse
+        trusted_domains = ['firebasestorage.googleapis.com', 'pastebin.com', 'gist.githubusercontent.com']
+        
         try:
+            parsed = urlparse(url)
+            if not any(parsed.netloc.endswith(domain) for domain in trusted_domains):
+                logger.error(f"Untrusted domain for external slot list: {parsed.netloc}")
+                return None
+            
+            # Fetch with size limit (5MB max) and timeout
+            max_size = 5 * 1024 * 1024  # 5MB
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
                     if response.status == 200:
+                        # Check content length
+                        content_length = response.headers.get('content-length')
+                        if content_length and int(content_length) > max_size:
+                            logger.error(f"External slot list too large: {content_length} bytes")
+                            return None
+                        
+                        # Read with size limit
                         content = await response.text()
+                        if len(content) > max_size:
+                            logger.error(f"External slot list content too large: {len(content)} bytes")
+                            return None
+                        
                         logger.info(f"Successfully fetched external slot list ({len(content)} chars)")
                         return content
                     else:
                         logger.error(f"Failed to fetch external slot list: HTTP {response.status}")
                         return None
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error fetching external slot list from {url}: {e}")
+            return None
         except Exception as e:
             logger.exception(f"Error fetching external slot list from {url}: {e}")
             return None

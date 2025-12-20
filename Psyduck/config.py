@@ -9,8 +9,6 @@ ROLL_LOG_CHANNEL_ID = 1450342934573617353  # PR roll-log
 LR_ALLOWED_CHANNEL_ID = 1450497852269924536 # LR botcalls
 LR_ROLL_LOG_CHANNEL_ID = 1450497935484653689  # LR roll-log
 
-ADMIN_USER_ID = 975054002431606844  # User who can run admin commands
-
 # Random.org Configuration
 RANDOM_ORG_API_URL = 'https://api.random.org/json-rpc/1/invoke'
 API_REQUEST_LIMIT = 4000  # Daily limit per API key
@@ -23,6 +21,8 @@ RESET_HOUR_UTC = 9
 VERSION = '1.0.0'
 BOT_NAME = 'GloveAndHisBoy'
 COMMAND_QUEUE_DELAY = 5  # Seconds between queued commands
+CALLED_LINKS_FILE = 'called_links.txt'  # File for tracking called raffles
+MAX_WINNERS = 100  # Maximum number of winners per raffle
 
 # Embed Colors
 EMBED_COLOR = 0x00FF00  # Green - you can change this to any hex color

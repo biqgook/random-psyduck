@@ -9,6 +9,8 @@ import base64
 import logging
 import re
 from typing import Optional
+from datetime import datetime
+import pytz
 import config
 
 logger = logging.getLogger('GloveAndHisBoy')
@@ -136,7 +138,8 @@ def create_winner_embed(numbers: list, request_count: int, request_limit: int,
             else:
                 footer_text = formatted_time
             embed.set_footer(text=footer_text)
-        except:
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Could not format timestamp {timestamp}: {e}")
             if caller_name:
                 embed.set_footer(text=f"Discord Bot Caller: {caller_name} | {timestamp}")
             else:
@@ -234,8 +237,8 @@ def validate_parameters(count: int, max_value: int) -> tuple:
     if max_value > 1000000:
         return (False, "Maximum value cannot exceed 1,000,000")
     
-    if count > 10000:
-        return (False, "Cannot pick more than 10,000 numbers at once")
+    if count > 1000:
+        return (False, "Cannot pick more than 1,000 numbers at once")
     
     return (True, None)
 
@@ -391,7 +394,8 @@ def create_verification_dm_embed(reddit_info: dict = None, numbers: list = None,
             else:
                 footer_text = formatted_time
             embed.set_footer(text=footer_text)
-        except:
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Could not format timestamp {timestamp}: {e}")
             if caller_name:
                 embed.set_footer(text=f"{timestamp} | {caller_name}")
             else:
