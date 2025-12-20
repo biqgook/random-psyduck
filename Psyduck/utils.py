@@ -7,9 +7,41 @@ import io
 import json
 import base64
 import logging
+import re
+from typing import Optional
+from datetime import datetime
+import pytz
 import config
 
 logger = logging.getLogger('GloveAndHisBoy')
+
+
+def parse_spots_from_title(title: str) -> Optional[int]:
+    """
+    Parse the number of spots from Reddit post title
+    
+    Examples:
+    - "[MAIN] PSA 10 SHINY RAYQUAZA PONCHO PIKACHU #231 - 223 spots at $40/ea" -> 223
+    - "[MINI] - Mini #3 (2 Winners) PSA 10 - 120 Spots at $5/ea" -> 120
+    - "[NM] Phantasmal Flames Booster box | 306 Spots @ $1ea" -> 306
+    
+    Args:
+        title: Reddit post title
+        
+    Returns:
+        Number of spots parsed from title, or None if not found
+    """
+    # Pattern to match "XXX Spots" or "XXX spots" (case insensitive)
+    pattern = r'(\d+)\s+[Ss]pots'
+    match = re.search(pattern, title)
+    
+    if match:
+        spots = int(match.group(1))
+        logger.info(f"Parsed {spots} spots from title: {title[:50]}...")
+        return spots
+    
+    logger.warning(f"Could not parse spots from title: {title[:50]}...")
+    return None
 
 
 def create_winner_embed(numbers: list, request_count: int, request_limit: int, 
@@ -30,14 +62,22 @@ def create_winner_embed(numbers: list, request_count: int, request_limit: int,
     Returns:
         Discord Embed object
     """
-    logger.info(f"Building embed with Reddit info - Author: {reddit_info.get('author')}, Has image: {bool(reddit_info.get('image_url'))}")
+    logger.info(f"Building embed with Reddit info - Author: {reddit_info.get('author') if reddit_info else 'None'}, Has image: {bool(reddit_info.get('image_url') if reddit_info else False)}")
     
     # Build description with all info in vertical order
     description_lines = []
-    embed = discord.Embed(
-        title=reddit_info['title'],
-        color=config.EMBED_COLOR
-    )
+    
+    # Handle missing reddit_info gracefully
+    if reddit_info and reddit_info.get('title'):
+        embed = discord.Embed(
+            title=reddit_info['title'],
+            color=config.EMBED_COLOR
+        )
+    else:
+        embed = discord.Embed(
+            title="Raffle Results",
+            color=config.EMBED_COLOR
+        )
 
     # Spots indicator (e.g., "1-100")
     if total_spots:
@@ -98,7 +138,8 @@ def create_winner_embed(numbers: list, request_count: int, request_limit: int,
             else:
                 footer_text = formatted_time
             embed.set_footer(text=footer_text)
-        except:
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Could not format timestamp {timestamp}: {e}")
             if caller_name:
                 embed.set_footer(text=f"Discord Bot Caller: {caller_name} | {timestamp}")
             else:
@@ -196,8 +237,8 @@ def validate_parameters(count: int, max_value: int) -> tuple:
     if max_value > 1000000:
         return (False, "Maximum value cannot exceed 1,000,000")
     
-    if count > 10000:
-        return (False, "Cannot pick more than 10,000 numbers at once")
+    if count > 1000:
+        return (False, "Cannot pick more than 1,000 numbers at once")
     
     return (True, None)
 
@@ -353,7 +394,8 @@ def create_verification_dm_embed(reddit_info: dict = None, numbers: list = None,
             else:
                 footer_text = formatted_time
             embed.set_footer(text=footer_text)
-        except:
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Could not format timestamp {timestamp}: {e}")
             if caller_name:
                 embed.set_footer(text=f"{timestamp} | {caller_name}")
             else:

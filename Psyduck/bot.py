@@ -10,7 +10,9 @@ from discord.ext import commands
 import logging
 import os
 import asyncio
+from datetime import datetime
 from dotenv import load_dotenv
+import pytz
 
 import config
 from random_org import RandomOrgManager
@@ -21,7 +23,8 @@ from roll_logger import RollLogger
 from utils import (
     create_winner_embed,
     validate_parameters,
-    VerificationButton
+    VerificationButton,
+    parse_spots_from_title
 )
 
 # Load environment variables
@@ -33,7 +36,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('GloveAndHisBoy')
-logger.setLevel(logging.INFO)  # Set our logger to WARNING too
+logger.setLevel(logging.INFO)
 
 # Bot setup with intents
 intents = discord.Intents.default()
@@ -86,6 +89,19 @@ if args.env != "pokemon":
     allow_id = config.LR_ALLOWED_CHANNEL_ID
     roll_id = config.LR_ROLL_LOG_CHANNEL_ID
 
+# Load admin user ID from environment
+admin_user_id = int(os.getenv('ADMIN_USER_ID', '0'))
+if not admin_user_id:
+    logger.error("ADMIN_USER_ID not found in environment variables!")
+    exit(1)
+
+# File lock for called_links.txt (use asyncio.Lock for async consistency)
+called_links_lock = asyncio.Lock()
+
+# Admin command cooldowns (prevent spam)
+admin_command_cooldowns = {}
+ADMIN_COOLDOWN_SECONDS = 5
+
 # Initialize Reddit manager
 try:
     reddit_manager = RedditManager(
@@ -97,7 +113,8 @@ try:
     )
 except Exception as e:
     logger.error(f"Failed to initialize Reddit manager: {e}")
-    reddit_manager = None
+    logger.error("Reddit manager is required for bot operation. Exiting...")
+    exit(1)
 
 
 @bot.event
@@ -145,7 +162,6 @@ async def on_ready():
             logger.warning(f"Could not find roll log channel {roll_id}")
     except Exception as e:
         logger.exception(f"Error initializing roll logger: {e}")
-        logger.exception(f"Error during startup cleanup: {e}")
 
 
 @bot.event
@@ -160,21 +176,46 @@ async def on_message(message):
         logger.info(f"Message detected in monitored channel from {message.author} (ID: {message.author.id}): '{message.content[:50]}'")
         
         # Check for admin cleanup commands
-        if message.author.id == config.ADMIN_USER_ID:
+        if message.author.id == admin_user_id:
             logger.info("User is admin - checking for commands")
             msg_content = message.content.strip()
+            
+            # Check cooldown
+            now = datetime.now()
+            last_command_time = admin_command_cooldowns.get(message.author.id)
+            if last_command_time and (now - last_command_time).total_seconds() < ADMIN_COOLDOWN_SECONDS:
+                remaining = ADMIN_COOLDOWN_SECONDS - (now - last_command_time).total_seconds()
+                try:
+                    await message.reply(f"⏳ Please wait {remaining:.1f} more seconds before using another admin command.")
+                except Exception:
+                    pass
+                return
             
             # Admin cleanup commands
             if msg_content == "-c":
                 logger.info("Admin '-c' (clean) command detected")
+                admin_command_cooldowns[message.author.id] = datetime.now()
                 await cleanup_user_messages(message.channel, message)
                 return
             elif msg_content == "-e":
                 logger.info("Admin '-e' (everything) command detected")
+                admin_command_cooldowns[message.author.id] = datetime.now()
                 await cleanup_everything(message.channel, message)
                 return
             elif msg_content == "-cdb":
-                logger.info("Admin '-cdb' (cleanup database) command detected")
+                logger.warning("Admin '-cdb' (cleanup database) command detected - asking for confirmation")
+                try:
+                    confirm_msg = await message.reply("⚠️ **WARNING**: This will delete ALL verification records from the database. Type `-cdb confirm` to proceed (30 seconds).")
+                    await asyncio.sleep(30)
+                    try:
+                        await confirm_msg.delete()
+                    except discord.errors.NotFound:
+                        pass  # Message already deleted
+                except Exception as e:
+                    logger.exception(f"Error sending confirmation message: {e}")
+                return
+            elif msg_content == "-cdb confirm":
+                logger.info("Admin confirmed database cleanup")
                 try:
                     deleted = verification_db.cleanup_all_records()
                     await message.reply(f"✅ Database cleaned up successfully! Deleted {deleted} verification records.")
@@ -204,7 +245,7 @@ async def startup_cleanup(channel: discord.TextChannel):
         deleted_count = 0
         async for msg in channel.history(limit=100):  # Check last 100 messages
             # Delete messages that are not from bot or admin
-            if msg.author.id != bot.user.id and msg.author.id != config.ADMIN_USER_ID:
+            if msg.author.id != bot.user.id and msg.author.id != admin_user_id:
                 try:
                     await msg.delete()
                     deleted_count += 1
@@ -233,27 +274,75 @@ async def cleanup_user_messages(channel: discord.TextChannel, trigger_message: d
         logger.info(f"Starting cleanup - removing user messages only")
         
         deleted_count = 0
+        messages_to_delete = []
+        
         async for msg in channel.history(limit=500):  # Limit to last 500 messages
             # Keep bot messages and admin messages
-            if msg.author.id != bot.user.id and msg.author.id != config.ADMIN_USER_ID:
-                try:
-                    await msg.delete()
-                    deleted_count += 1
-                    # Rate limit protection: wait between deletions
-                    await asyncio.sleep(0.5)  # 2 deletions per second
-                except discord.errors.NotFound:
-                    pass  # Message already deleted
-                except discord.errors.Forbidden:
-                    logger.error(f"Missing permissions to delete message {msg.id}")
-                except Exception as e:
-                    logger.exception(f"Error deleting message {msg.id}: {e}")
+            if msg.author.id != bot.user.id and msg.author.id != admin_user_id:
+                messages_to_delete.append(msg)
+        
+        # Use bulk delete for messages < 14 days old
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        bulk_delete_msgs = [msg for msg in messages_to_delete if (now - msg.created_at).days < 14]
+        old_msgs = [msg for msg in messages_to_delete if (now - msg.created_at).days >= 14]
+        
+        # Bulk delete recent messages in chunks of 100 (Discord limit)
+        if bulk_delete_msgs:
+            try:
+                # Split into chunks of 100
+                chunk_size = 100
+                for i in range(0, len(bulk_delete_msgs), chunk_size):
+                    chunk = bulk_delete_msgs[i:i + chunk_size]
+                    await channel.delete_messages(chunk)
+                    deleted_count += len(chunk)
+                    logger.info(f"Bulk deleted {len(chunk)} messages")
+                    # Small delay between chunks to avoid rate limits
+                    if i + chunk_size < len(bulk_delete_msgs):
+                        await asyncio.sleep(1)
+            except discord.errors.Forbidden:
+                logger.error(f"Missing permissions to bulk delete messages")
+                # Fall back to individual deletion
+                for msg in bulk_delete_msgs:
+                    try:
+                        await msg.delete()
+                        deleted_count += 1
+                        await asyncio.sleep(0.5)
+                    except (discord.errors.NotFound, discord.errors.Forbidden) as e:
+                        logger.warning(f"Could not delete message {msg.id}: {e}")
+            except Exception as e:
+                logger.exception(f"Error during bulk delete: {e}")
+                # Fall back to individual deletion
+                for msg in bulk_delete_msgs:
+                    try:
+                        await msg.delete()
+                        deleted_count += 1
+                        await asyncio.sleep(0.5)
+                    except (discord.errors.NotFound, discord.errors.Forbidden) as e:
+                        logger.warning(f"Could not delete message {msg.id}: {e}")
+        
+        # Delete old messages individually
+        for msg in old_msgs:
+            try:
+                await msg.delete()
+                deleted_count += 1
+                await asyncio.sleep(0.5)
+            except discord.errors.NotFound:
+                pass
+            except discord.errors.Forbidden:
+                logger.error(f"Missing permissions to delete message {msg.id}")
+            except Exception as e:
+                logger.exception(f"Error deleting message {msg.id}: {e}")
         
         logger.info(f"Cleanup complete - deleted {deleted_count} user messages")
         
         # Send confirmation (will auto-delete after 5 seconds)
         confirm_msg = await channel.send(f"✅ Cleaned up {deleted_count} user messages")
         await asyncio.sleep(5)
-        await confirm_msg.delete()
+        try:
+            await confirm_msg.delete()
+        except discord.errors.NotFound:
+            pass  # Message already deleted
         
     except Exception as e:
         logger.exception(f"Error during cleanup: {e}")
@@ -264,20 +353,58 @@ async def cleanup_everything(channel: discord.TextChannel, trigger_message: disc
     try:
         logger.info(f"Starting full cleanup - removing ALL messages (including bot and admin)")
         
-        # Don't delete the trigger message first - let it be deleted in the loop
         deleted_count = 0
         failed_count = 0
+        messages_to_delete = []
         
         async for msg in channel.history(limit=500):  # Limit to last 500 messages
+            messages_to_delete.append(msg)
+        
+        # Use bulk delete for messages < 14 days old
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        bulk_delete_msgs = [msg for msg in messages_to_delete if (now - msg.created_at).days < 14]
+        old_msgs = [msg for msg in messages_to_delete if (now - msg.created_at).days >= 14]
+        
+        # Bulk delete recent messages in chunks of 100
+        if bulk_delete_msgs:
             try:
-                logger.debug(f"Deleting message {msg.id} from {msg.author.name}")
+                chunk_size = 100
+                for i in range(0, len(bulk_delete_msgs), chunk_size):
+                    chunk = bulk_delete_msgs[i:i + chunk_size]
+                    await channel.delete_messages(chunk)
+                    deleted_count += len(chunk)
+                    logger.info(f"Bulk deleted {len(chunk)} messages")
+                    if i + chunk_size < len(bulk_delete_msgs):
+                        await asyncio.sleep(1)
+            except discord.errors.Forbidden:
+                logger.error(f"Missing permissions to bulk delete messages")
+                failed_count += len(bulk_delete_msgs)
+            except Exception as e:
+                logger.exception(f"Error during bulk delete: {e}")
+                # Fall back to individual deletion
+                for msg in bulk_delete_msgs:
+                    try:
+                        await msg.delete()
+                        deleted_count += 1
+                        await asyncio.sleep(0.5)
+                    except discord.errors.NotFound:
+                        pass
+                    except discord.errors.Forbidden:
+                        logger.error(f"Missing permissions to delete message {msg.id}")
+                        failed_count += 1
+                    except Exception as e2:
+                        logger.exception(f"Error deleting message {msg.id}: {e2}")
+                        failed_count += 1
+        
+        # Delete old messages individually
+        for msg in old_msgs:
+            try:
                 await msg.delete()
                 deleted_count += 1
-                # Rate limit protection: wait between deletions
-                await asyncio.sleep(0.5)  # 2 deletions per second
+                await asyncio.sleep(0.5)
             except discord.errors.NotFound:
-                logger.debug(f"Message {msg.id} already deleted")
-                pass  # Message already deleted
+                pass
             except discord.errors.Forbidden:
                 logger.error(f"Missing permissions to delete message {msg.id}")
                 failed_count += 1
@@ -294,14 +421,14 @@ async def cleanup_everything(channel: discord.TextChannel, trigger_message: disc
 @bot.tree.command(name="call", description="Generate random winner(s) for a raffle")
 @app_commands.describe(
     reddit_url="Reddit post URL for the raffle",
-    spots="Total number of spots in the raffle",
+    spots="Total number of spots (optional - will parse from Reddit title if not provided)",
     winners="Number of winners to select (default: 1)"
 )
 async def call_command(
     interaction: discord.Interaction,
     reddit_url: str,
-    spots: int,
-    winners: int = 1
+    spots: app_commands.Range[int, 1, 1000000] = None,
+    winners: app_commands.Range[int, 1, 100] = 1
 ):
     """Slash command to generate random winners"""
 
@@ -313,62 +440,171 @@ async def call_command(
         )
         return
     
+    # Validate Reddit URL format
+    if not ('reddit.com' in reddit_url or 'redd.it' in reddit_url):
+        await interaction.response.send_message(
+            "❌ Invalid Reddit URL. Please provide a valid Reddit post link.",
+            ephemeral=True
+        )
+        return
+    
+    # Defer response to allow time for Reddit fetch
+    await interaction.response.defer(ephemeral=True)
+    
+    # Fetch Reddit info first to validate spots
+    try:
+        reddit_info = await reddit_manager.get_post_info(reddit_url)
+        if not reddit_info:
+            await interaction.followup.send(
+                "❌ Could not fetch Reddit post. Please verify the URL is correct.",
+                ephemeral=True
+            )
+            return
+    except Exception as e:
+        logger.exception(f"Error fetching Reddit info for validation: {e}")
+        # Check if it's an external slot list error
+        error_msg = str(e)
+        if "external slot list" in error_msg.lower():
+            await interaction.followup.send(
+                f"❌ **External Slot List Error**\n{error_msg}\n\n"
+                "Please contact a moderator to fix the external slot list link.",
+                ephemeral=True
+            )
+        elif "no spot assignments" in error_msg.lower():
+            await interaction.followup.send(
+                f"❌ **No Spot Assignments Found**\n{error_msg}\n\n"
+                "Please wait until participants have joined the raffle before calling it.",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                "❌ Error fetching Reddit post. Please try again.",
+                ephemeral=True
+            )
+        return
+    
+    # Parse spots from title
+    parsed_spots = parse_spots_from_title(reddit_info.get('title', ''))
+    
+    # Check for duplicate raffle BEFORE queuing (with lock to prevent race condition)
+    try:
+        reddit_permalink = reddit_info.get('url')
+        if reddit_permalink:
+            async with called_links_lock:
+                links = load_links(config.CALLED_LINKS_FILE)
+                if reddit_permalink in links:
+                    await interaction.followup.send(
+                        "❌ **This raffle has already been called**\n\n"
+                        "If you believe this is an error, please contact an admin.",
+                        ephemeral=True
+                    )
+                    return
+    except Exception as e:
+        logger.warning(f"Error checking duplicate links: {e}")
+        # Continue anyway - duplicate check failure shouldn't block raffle
+    
+    # Validate spots parameter
+    if spots is not None and parsed_spots is not None:
+        # User provided spots - validate against title
+        if spots != parsed_spots:
+            await interaction.followup.send(
+                f"❌ **Spot count doesn't match title**\n\n"
+                f"Reddit post has **{parsed_spots} spots**, but you entered **{spots}**.\n"
+                f"Please try again with the correct amount.",
+                ephemeral=True
+            )
+            return
+        logger.info(f"Spot validation passed: user input {spots} matches title {parsed_spots}")
+    elif spots is None and parsed_spots is not None:
+        # User didn't provide spots - use parsed value
+        spots = parsed_spots
+        logger.info(f"Auto-filled spots from title: {spots}")
+    elif spots is None and parsed_spots is None:
+        # Couldn't parse and user didn't provide
+        await interaction.followup.send(
+            "❌ **Could not determine spot count**\n\n"
+            "Could not parse spots from Reddit title. Please include the spots parameter.",
+            ephemeral=True
+        )
+        return
+    # else: spots provided, no parsed value - allow it (fallback case)
+    
     # Validate parameters
     is_valid, error_message = validate_parameters(winners, spots)
     if not is_valid:
-        await interaction.response.send_message(f"❌ {error_message}", ephemeral=True)
+        await interaction.followup.send(f"❌ {error_message}", ephemeral=True)
         return
     
     # Check queue position
     queue_position = command_queue.get_queue_position()
     
     if queue_position > 0:
-        # Send initial response with queue position (ephemeral so it doesn't clutter)
-        await interaction.response.send_message(
-            f"⏳ Your request is queued. Position: **{queue_position + 1}**\n"
+        # Send response with queue position (queue_position is 0-indexed count, so display as-is for "1st in queue")
+        await interaction.followup.send(
+            f"⏳ Your request is queued. Position: **{queue_position}**\n"
             f"*Please wait, processing will begin shortly...*",
             ephemeral=True
         )
     else:
-        # Respond immediately with ephemeral message so interaction doesn't fail
-        await interaction.response.send_message("🎲 Processing...", ephemeral=True)
+        # Confirm processing
+        await interaction.followup.send("🎲 Processing...", ephemeral=True)
 
-    # Add to queue with channel reference and caller user object
-    await command_queue.add_to_queue(process_call_command, interaction.channel, reddit_url, spots, winners, interaction.user)
+    # Add to queue with channel reference, caller user object, and pre-fetched reddit_info
+    await command_queue.add_to_queue(process_call_command, interaction.channel, reddit_url, spots, winners, interaction.user, reddit_info)
 
 async def process_call_command(
     channel: discord.TextChannel,
     reddit_url: str,
     spots: int,
     winners: int,
-    caller_user: discord.User
+    caller_user: discord.User,
+    reddit_info: dict = None
 ):
     """Process the actual command execution"""
     caller_name = caller_user.display_name
-    links = load_links("called_links.txt")
 
     logger.info(f'Processing call command. caller_name: {caller_name} | reddit_url: {reddit_url} | spots: {spots} | winners: {winners}')
     
-    # Fetch Reddit post information
-    reddit_info = None
-    if reddit_manager:
+    # Use pre-fetched Reddit info if available (from validation), otherwise fetch
+    if reddit_info is None:
+        logger.info("Reddit info not pre-fetched, fetching now...")
         try:
             reddit_info = await reddit_manager.get_post_info(reddit_url)
             if not reddit_info:
                 await channel.send("⚠️ Could not fetch Reddit post information, but continuing with number generation...")
-
-            link = reddit_info['url']
-            logger.info(f'links: {links}')
-            if link not in links:
-                links.add(link)
-                with open("called_links.txt", "a", encoding="utf-8") as f:
-                    f.write(link + "\n")
-            else:
-                await channel.send("⚠️  This raffle appears to have its results be called already. If you believe there is a mistake, please message Dasxce.")
-                return
         except Exception as e:
             logger.exception(f"Error fetching Reddit info: {e}")
-            await channel.send("⚠️ Error fetching Reddit post, but continuing with number generation...")
+            error_msg = str(e)
+            # Check if it's an external slot list error - this should stop the raffle
+            if "external slot list" in error_msg.lower():
+                await channel.send(
+                    f"❌ **Cannot proceed with raffle**\n{error_msg}\n\n"
+                    "Please contact a moderator to fix the external slot list link before calling this raffle."
+                )
+                return  # Stop raffle execution
+            elif "no spot assignments" in error_msg.lower():
+                await channel.send(
+                    f"❌ **Cannot proceed with raffle**\n{error_msg}\n\n"
+                    "Please wait until participants have joined before calling this raffle."
+                )
+                return  # Stop raffle execution
+            else:
+                await channel.send("⚠️ Error fetching Reddit post, but continuing with number generation...")
+    else:
+        logger.info("Using pre-fetched Reddit info from validation")
+    
+    # Mark raffle as called (duplicate already checked in /call command before queuing)
+    if reddit_info:
+        try:
+            link = reddit_info['url']
+            # Write to file with async lock to prevent race conditions
+            async with called_links_lock:
+                with open(config.CALLED_LINKS_FILE, "a", encoding="utf-8") as f:
+                    f.write(link + "\n")
+            logger.info(f"Marked raffle as called: {link}")
+        except Exception as e:
+            logger.exception(f"Error writing to called_links.txt: {e}")
+            # Continue - file write failure shouldn't stop raffle
     
     try:
         # Generate random numbers (will retry every 5 minutes if API is down)
@@ -391,18 +627,28 @@ async def process_call_command(
         # Add winners section if spot assignments are available
         if reddit_info and reddit_info.get('spot_assignments'):
             spot_assignments = reddit_info['spot_assignments']
+            user_spot_counts = reddit_info.get('user_spot_counts', {})
             winner_arr = []
             for number in numbers:
                 username = spot_assignments.get(number, "Unknown")
                 # Create hyperlink to user's Reddit profile
                 if username != "Unknown":
-                    winner_arr.append(f"{number} - [{username}](https://reddit.com/u/{username})")
+                    # Calculate percentage if available
+                    if username in user_spot_counts:
+                        user_spots = user_spot_counts[username]
+                        percentage = (user_spots / spots * 100) if spots > 0 else 0
+                        # Format percentage to remove trailing zeros (17.5% instead of 17.50%)
+                        percentage_str = f"{percentage:.1f}".rstrip('0').rstrip('.')
+                        winner_arr.append(f"{number} - [{username}](https://reddit.com/u/{username}) {percentage_str}%")
+                    else:
+                        winner_arr.append(f"{number} - [{username}](https://reddit.com/u/{username})")
                 else:
                     winner_arr.append(f"{number} - {username}")
         
             winning_content = "# **Winners:** " + " | ".join(winner_arr)
         else:
-            winning_content = "# **Winning numbers:** " + " | ".join(numbers)
+            # Convert numbers to strings for join
+            winning_content = "# **Winning numbers:** " + " | ".join(map(str, numbers))
 
         need_detailed_winners = len(winning_content) >= 256
         if need_detailed_winners:
@@ -493,16 +739,14 @@ async def process_call_command(
             
             # Set footer with timestamp
             if timestamp:
-                from datetime import datetime
-                import pytz
                 try:
                     dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
                     est = pytz.timezone('US/Eastern')
                     dt_est = dt.astimezone(est)
                     formatted_time = dt_est.strftime('%Y-%m-%d %I:%M %p')
                     dm_embed.set_footer(text=formatted_time)
-                except:
-                    pass
+                except (ValueError, AttributeError) as e:
+                    logger.warning(f"Could not format timestamp {timestamp}: {e}")
             
             await caller_user.send(embed=dm_embed)
             logger.info(f"Sent results DM to {caller_user.name}")
@@ -536,9 +780,28 @@ async def on_error(event, *args, **kwargs):
 
 
 def load_links(path):
-    with open(path, encoding="utf-8") as f:
-        return {line.strip() for line in f}
+    """Load called links from file with proper error handling"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        logger.warning(f"Links file {path} not found, returning empty set")
+        return set()
+    except Exception as e:
+        logger.exception(f"Error loading links from {path}: {e}")
+        return set()
+
     
+async def shutdown():
+    """Cleanup on shutdown"""
+    try:
+        if reddit_manager:
+            await reddit_manager.close()
+            logger.info("Reddit manager closed successfully")
+    except Exception as e:
+        logger.exception(f"Error during shutdown: {e}")
+
+
 def main():
     """Main entry point"""
     # Get Discord token
@@ -551,13 +814,13 @@ def main():
     # Start the bot
     try:
         bot.run(discord_token)
+    except KeyboardInterrupt:
+        logger.info("Bot shutting down by user request")
     except Exception as e:
         logger.exception(f"Failed to start bot: {e}")
     finally:
-        # Cleanup Reddit client
-        if reddit_manager:
-            import asyncio
-            asyncio.run(reddit_manager.close())
+        # Cleanup
+        asyncio.run(shutdown())
 
 
 if __name__ == "__main__":
